@@ -164,8 +164,10 @@ def create_d3_viz(data: Dict, complexity_map: pd.DataFrame, filters: Dict) -> st
         <script>
             const data = {data_json};
             const complexity = {complexity_json};
-            const width = 1200, height = 800;
-            let focused = null, showLabels = true;
+            const width = 1200;
+            const height = 800;
+            let focused = null;
+            let showLabels = true;
             
             const complexityMap = new Map(complexity.map(d => [d.capability, d.complexity]));
             
