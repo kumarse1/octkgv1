@@ -174,7 +174,7 @@ def create_d3_viz(data: Dict, complexity_map: pd.DataFrame, filters: Dict) -> st
                 .call(d3.zoom().scaleExtent([0.1, 4])
                     .on("zoom", e => g.attr("transform", e.transform)));
             
-            const g = svg.append("g").attr("transform", `translate(${{width/2}},${{height/2}})`);
+            const g = svg.append("g").attr("transform", "translate(" + width/2 + "," + height/2 + ")");
             const linkG = g.append("g"), nodeG = g.append("g");
             
             const tree = d3.tree()
@@ -199,7 +199,7 @@ def create_d3_viz(data: Dict, complexity_map: pd.DataFrame, filters: Dict) -> st
                     .data(root.descendants(), d => d.data.id)
                     .join("g")
                     .attr("class", "node")
-                    .attr("transform", d => `rotate(${{d.x * 180 / Math.PI - 90}}) translate(${{d.y}},0)`)
+                    .attr("transform", d => "rotate(" + (d.x * 180 / Math.PI - 90) + ") translate(" + d.y + ",0)")
                     .on("click", (e, d) => {{ focused = focused?.data.id === d.data.id ? null : d; update(); }});
                 
                 node.selectAll("circle").remove();
@@ -218,7 +218,7 @@ def create_d3_viz(data: Dict, complexity_map: pd.DataFrame, filters: Dict) -> st
                     }})
                     .on("mouseover", (e, d) => {{
                         d3.select("#tooltip").style("opacity", 1)
-                            .html(`<b>${{d.data.name}}</b><br/>Type: ${{d.data.label}}<br/>Layer: ${{d.data.properties?.layer||'N/A'}}`)
+                            .html("<b>" + d.data.name + "</b><br/>Type: " + d.data.label + "<br/>Layer: " + (d.data.properties?.layer||'N/A'))
                             .style("left", e.pageX + 10 + "px").style("top", e.pageY - 10 + "px");
                     }})
                     .on("mouseout", () => d3.select("#tooltip").style("opacity", 0));
@@ -233,8 +233,11 @@ def create_d3_viz(data: Dict, complexity_map: pd.DataFrame, filters: Dict) -> st
                     .text(d => showLabels ? (d.data.name.length > 20 ? d.data.name.substring(0,20)+"..." : d.data.name) : "");
             }}
             
-            function resetView() {{ focused = null; update(); 
-                svg.transition().duration(750).call(d3.zoom().transform, d3.zoomIdentity.translate(width/2, height/2)); }}
+            function resetView() {{ 
+                focused = null; 
+                update(); 
+                svg.transition().duration(750).call(d3.zoom().transform, d3.zoomIdentity.translate(width/2, height/2)); 
+            }}
             function toggleLabels() {{ showLabels = !showLabels; update(); }}
             function search(term) {{
                 if (!term) {{ focused = null; update(); return; }}
