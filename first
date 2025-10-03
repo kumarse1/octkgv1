@@ -1,0 +1,828 @@
+import streamlit as st
+import pandas as pd
+import psycopg2
+import json
+import requests
+import base64
+from typing import Dict, List, Set
+from collections import defaultdict
+
+# Configuration
+st.set_page_config(page_title="Knowledge Graph Viewer", page_icon="🏗️", layout="wide")
+
+DB_CONFIG = {"dbname": "", "user": "", "password": "", "host": "", "port": ""}
+API_CONFIG = {
+    "base_url": "YOUR_SMAPI_ENDPOINT",
+    "endpoint": "/v1/chat/completions",
+    "username": "", "password": "", "api_key": "",
+    "model": "gpt-4", "timeout": 30
+}
+
+# Database Functions
+def get_connection(username: str, password: str):
+    return psycopg2.connect(dbname=DB_CONFIG["dbname"], user=username, 
+                          password=password, host=DB_CONFIG["host"], 
+                          port=DB_CONFIG["port"])
+
+@st.cache_data(ttl=300)
+def load_data(_conn):
+    nodes = pd.read_sql("SELECT node_id, label, name, properties FROM kg_nodes", _conn)
+    edges = pd.read_sql("SELECT source_node_id, target_node_id, relation_type FROM kg_edges", _conn)
+    return nodes, edges
+
+# Analysis Functions
+class ArchitectureAnalyzer:
+    def __init__(self, nodes_df: pd.DataFrame, edges_df: pd.DataFrame):
+        self.nodes = nodes_df
+        self.edges = edges_df
+        self.capabilities = nodes_df[nodes_df['label'] == 'Capability']
+        
+    def get_dependencies(self, node_id: int) -> Dict:
+        upstream = self.edges[self.edges['target_node_id'] == node_id]['source_node_id'].tolist()
+        downstream = self.edges[self.edges['source_node_id'] == node_id]['target_node_id'].tolist()
+        return {
+            'upstream': self._get_names(upstream),
+            'downstream': self._get_names(downstream),
+            'criticality': 'High' if len(downstream) > 5 else 'Medium' if len(downstream) > 2 else 'Low'
+        }
+    
+    def common_components(self) -> pd.DataFrame:
+        usage = defaultdict(list)
+        for _, edge in self.edges.iterrows():
+            target = self.nodes[self.nodes['node_id'] == edge['target_node_id']]
+            if not target.empty and target.iloc[0]['label'] in ['Component', 'System']:
+                source = self.nodes[self.nodes['node_id'] == edge['source_node_id']]
+                if not source.empty:
+                    usage[edge['target_node_id']].append(source.iloc[0]['name'])
+        
+        result = [{'component': self.nodes[self.nodes['node_id']==k].iloc[0]['name'],
+                   'count': len(v), 'used_by': v}
+                  for k, v in usage.items() if len(v) > 1]
+        return pd.DataFrame(result).sort_values('count', ascending=False) if result else pd.DataFrame()
+    
+    def complexity_map(self) -> pd.DataFrame:
+        data = []
+        for _, cap in self.capabilities.iterrows():
+            incoming = len(self.edges[self.edges['target_node_id'] == cap['node_id']])
+            outgoing = len(self.edges[self.edges['source_node_id'] == cap['node_id']])
+            props = json.loads(cap['properties']) if isinstance(cap['properties'], str) else cap['properties']
+            data.append({
+                'capability': cap['name'],
+                'layer': props.get('layer', 'Unknown'),
+                'complexity': incoming + outgoing,
+                'fan_in': incoming,
+                'fan_out': outgoing
+            })
+        return pd.DataFrame(data).sort_values('complexity', ascending=False)
+    
+    def _get_names(self, node_ids: List[int]) -> List[str]:
+        return [self.nodes[self.nodes['node_id']==nid].iloc[0]['name'] 
+                for nid in node_ids if not self.nodes[self.nodes['node_id']==nid].empty]
+
+# LLM Functions
+def query_llm(question: str, context: str) -> str:
+    try:
+        headers = {"Content-Type": "application/json"}
+        if API_CONFIG["username"] and API_CONFIG["password"]:
+            creds = f"{API_CONFIG['username']}:{API_CONFIG['password']}"
+            headers["Authorization"] = f"Basic {base64.b64encode(creds.encode()).decode()}"
+        elif API_CONFIG["api_key"]:
+            headers["Authorization"] = f"Bearer {API_CONFIG['api_key']}"
+        
+        payload = {
+            "model": API_CONFIG["model"],
+            "messages": [
+                {"role": "system", "content": "You are a business architecture expert. Provide clear insights on capabilities, dependencies, and components."},
+                {"role": "user", "content": f"{context}\n\nQuestion: {question}"}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1000
+        }
+        
+        response = requests.post(
+            API_CONFIG["base_url"] + API_CONFIG["endpoint"],
+            json=payload, headers=headers, timeout=API_CONFIG["timeout"]
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            elif "content" in data:
+                return data["content"][0]["text"] if isinstance(data["content"], list) else data["content"]
+            return data.get("response", "Response received but format unclear")
+        
+        return f"API Error ({response.status_code}): {response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def build_context(analyzer: ArchitectureAnalyzer, domain: str, layers: Set[str]) -> str:
+    common = analyzer.common_components()
+    complex_caps = analyzer.complexity_map()
+def create_d3_viz(data: Dict, complexity_map: pd.DataFrame, filters: Dict) -> str:
+    """D3.js radial tree visualization"""
+    data_json = json.dumps(data)
+    complexity_json = complexity_map.to_json(orient='records') if not complexity_map.empty else '[]'
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://d3js.org/d3.v7.min.js"></script>
+        <style>
+            body {{ margin: 0; background: #f8f9fa; font-family: Arial; }}
+            .node circle {{ stroke: #333; stroke-width: 2px; cursor: pointer; transition: all 0.3s; }}
+            .node circle:hover {{ stroke: #ff6b6b; stroke-width: 4px; }}
+            .node circle.focused {{ stroke: #2ecc71; stroke-width: 4px; }}
+            .node circle.dimmed {{ opacity: 0.15; }}
+            .node text {{ font-size: 11px; pointer-events: none; }}
+            .node text.dimmed {{ opacity: 0.2; }}
+            .link {{ fill: none; stroke: #ccc; stroke-width: 2px; transition: all 0.3s; }}
+            .link.dimmed {{ opacity: 0.1; }}
+            .link.focused {{ stroke: #2ecc71; stroke-width: 3px; }}
+            .tooltip {{ position: absolute; padding: 10px; background: rgba(0,0,0,0.9); 
+                       color: white; border-radius: 5px; opacity: 0; pointer-events: none; z-index: 1000; }}
+            .controls {{ position: fixed; top: 10px; left: 10px; background: white; 
+                        padding: 10px; border-radius: 5px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); z-index: 100; }}
+            .controls button {{ margin: 3px; padding: 6px 10px; cursor: pointer; }}
+            .search {{ position: fixed; top: 10px; right: 10px; background: white; 
+                      padding: 10px; border-radius: 5px; z-index: 100; }}
+            .search input {{ padding: 6px; border: 1px solid #ddd; border-radius: 3px; }}
+        </style>
+    </head>
+    <body>
+        <div class="controls">
+            <button onclick="resetView()">Reset</button>
+            <button onclick="toggleLabels()">Labels</button>
+        </div>
+        <div class="search">
+            <input type="text" placeholder="Search..." onkeyup="search(this.value)">
+        </div>
+        <div id="graph"></div>
+        <div class="tooltip" id="tooltip"></div>
+        
+        <script>
+            const data = {data_json};
+            const complexity = {complexity_json};
+            const width = 1200, height = 800;
+            let focused = null, showLabels = true;
+            
+            const complexityMap = new Map(complexity.map(d => [d.capability, d.complexity]));
+            
+            const svg = d3.select("#graph").append("svg")
+                .attr("width", width).attr("height", height)
+                .call(d3.zoom().scaleExtent([0.1, 4])
+                    .on("zoom", e => g.attr("transform", e.transform)));
+            
+            const g = svg.append("g").attr("transform", `translate(${{width/2}},${{height/2}})`);
+            const linkG = g.append("g"), nodeG = g.append("g");
+            
+            const tree = d3.tree()
+                .size([2 * Math.PI, Math.min(width, height) / 2 - 100])
+                .separation((a, b) => (a.parent == b.parent ? 1 : 2) / a.depth);
+            
+            function update() {{
+                const root = d3.hierarchy(data);
+                tree(root);
+                
+                const link = linkG.selectAll(".link")
+                    .data(root.links(), d => d.target.data.id)
+                    .join("path")
+                    .attr("class", d => {{
+                        if (!focused) return "link";
+                        const isFocused = d.source.data.id === focused.data.id || d.target.data.id === focused.data.id;
+                        return isFocused ? "link focused" : "link dimmed";
+                    }})
+                    .attr("d", d3.linkRadial().angle(d => d.x).radius(d => d.y));
+                
+                const node = nodeG.selectAll(".node")
+                    .data(root.descendants(), d => d.data.id)
+                    .join("g")
+                    .attr("class", "node")
+                    .attr("transform", d => `rotate(${{d.x * 180 / Math.PI - 90}}) translate(${{d.y}},0)`)
+                    .on("click", (e, d) => {{ focused = focused?.data.id === d.data.id ? null : d; update(); }});
+                
+                node.selectAll("circle").remove();
+                node.append("circle")
+                    .attr("r", d => {{
+                        const c = complexityMap.get(d.data.name) || 0;
+                        return d.depth === 0 ? 10 : 5 + Math.min(c / 5, 10);
+                    }})
+                    .attr("class", d => {{
+                        if (!focused) return "";
+                        return d.data.id === focused.data.id ? "focused" : "dimmed";
+                    }})
+                    .style("fill", d => {{
+                        const colors = {{'L0':'#FF6B6B','L1':'#4ECDC4','L2':'#45B7D1','L3':'#96CEB4','L4':'#FFEAA7'}};
+                        return colors[d.data.properties?.layer] || '#999';
+                    }})
+                    .on("mouseover", (e, d) => {{
+                        d3.select("#tooltip").style("opacity", 1)
+                            .html(`<b>${{d.data.name}}</b><br/>Type: ${{d.data.label}}<br/>Layer: ${{d.data.properties?.layer||'N/A'}}`)
+                            .style("left", e.pageX + 10 + "px").style("top", e.pageY - 10 + "px");
+                    }})
+                    .on("mouseout", () => d3.select("#tooltip").style("opacity", 0));
+                
+                node.selectAll("text").remove();
+                node.append("text")
+                    .attr("dy", "0.31em")
+                    .attr("x", d => d.x < Math.PI ? 8 : -8)
+                    .attr("text-anchor", d => d.x < Math.PI ? "start" : "end")
+                    .attr("transform", d => d.x >= Math.PI ? "rotate(180)" : null)
+                    .attr("class", d => focused && d.data.id !== focused.data.id ? "dimmed" : "")
+                    .text(d => showLabels ? (d.data.name.length > 20 ? d.data.name.substring(0,20)+"..." : d.data.name) : "");
+            }}
+            
+            function resetView() {{ focused = null; update(); 
+                svg.transition().duration(750).call(d3.zoom().transform, d3.zoomIdentity.translate(width/2, height/2)); }}
+            function toggleLabels() {{ showLabels = !showLabels; update(); }}
+            function search(term) {{
+                if (!term) {{ focused = null; update(); return; }}
+                const root = d3.hierarchy(data);
+                focused = root.descendants().find(d => d.data.name.toLowerCase().includes(term.toLowerCase()));
+                update();
+            }}
+            
+            update();
+        </script>
+    </body>
+    </html>
+    """
+
+def prepare_graph_data(nodes_df: pd.DataFrame, edges_df: pd.DataFrame) -> tuple:
+    """Prepare data for both visualization types"""
+    # For Cytoscape (flat list)
+    cyto_nodes = []
+    for _, node in nodes_df.iterrows():
+        props = json.loads(node['properties']) if isinstance(node['properties'], str) else node['properties']
+        cyto_nodes.append({
+            'id': int(node['node_id']),
+            'name': node['name'],
+            'type': node['label'],
+            'layer': props.get('layer', 'L0')
+        })
+    
+    cyto_edges = []
+    for _, edge in edges_df.iterrows():
+        cyto_edges.append({
+            'source': int(edge['source_node_id']),
+            'target': int(edge['target_node_id']),
+            'relation': edge['relation_type']
+        })
+    
+    return cyto_nodes, cyto_edgesBusiness Architecture Context:
+Domain: {domain}
+Layers: {', '.join(sorted(layers))}
+Total Capabilities: {len(analyzer.capabilities)}
+
+Top Shared Components:
+{common.head(3).to_string() if not common.empty else 'None'}
+
+Most Complex Capabilities:
+{complex_caps.head(5)[['capability', 'layer', 'complexity']].to_string()}
+"""
+
+# Visualization Options
+def create_cytoscape_viz(nodes: List[Dict], edges: List[Dict], complexity_map: pd.DataFrame) -> str:
+    """Cytoscape.js hierarchical network visualization"""
+    nodes_json = json.dumps(nodes)
+    edges_json = json.dumps(edges)
+    complexity_json = complexity_map.to_json(orient='records') if not complexity_map.empty else '[]'
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+        <script src="https://unpkg.com/layout-base/layout-base.js"></script>
+        <script src="https://unpkg.com/cose-base/cose-base.js"></script>
+        <script src="https://unpkg.com/cytoscape-fcose/cytoscape-fcose.js"></script>
+        <style>
+            body {{ margin: 0; background: #f8f9fa; font-family: Arial; }}
+            #cy {{ width: 100%; height: 800px; background: white; }}
+            .controls {{ position: absolute; top: 10px; left: 10px; background: white; 
+                        padding: 10px; border-radius: 5px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); z-index: 100; }}
+            .controls button {{ margin: 3px; padding: 6px 10px; cursor: pointer; border: 1px solid #ddd; 
+                               background: white; border-radius: 3px; }}
+            .controls button:hover {{ background: #f0f0f0; }}
+            .controls select {{ margin: 3px; padding: 6px; border: 1px solid #ddd; border-radius: 3px; }}
+            .search {{ position: absolute; top: 10px; right: 10px; background: white; 
+                      padding: 10px; border-radius: 5px; z-index: 100; }}
+            .search input {{ padding: 6px; border: 1px solid #ddd; border-radius: 3px; width: 200px; }}
+            .info {{ position: absolute; bottom: 10px; left: 10px; background: white; 
+                    padding: 10px; border-radius: 5px; max-width: 300px; display: none; z-index: 100; }}
+        </style>
+    </head>
+    <body>
+        <div class="controls">
+            <select id="layoutSelect" onchange="changeLayout(this.value)">
+                <option value="fcose">Force Directed</option>
+                <option value="breadthfirst">Hierarchical</option>
+                <option value="circle">Circular</option>
+                <option value="grid">Grid</option>
+                <option value="concentric">Concentric</option>
+            </select>
+            <button onclick="resetView()">Reset</button>
+            <button onclick="fitGraph()">Fit</button>
+            <button onclick="showAll()">Show All</button>
+        </div>
+        <div class="search">
+            <input type="text" id="searchInput" placeholder="Search nodes..." onkeyup="searchNodes(this.value)">
+        </div>
+        <div id="cy"></div>
+        <div class="info" id="info"></div>
+        
+        <script>
+            const nodesData = {nodes_json};
+            const edgesData = {edges_json};
+            const complexity = {complexity_json};
+            
+            const complexityMap = new Map(complexity.map(d => [d.capability, d.complexity]));
+            
+            const elements = [
+                ...nodesData.map(n => ({{
+                    data: {{ 
+                        id: String(n.id), 
+                        label: n.name,
+                        layer: n.layer || 'L0',
+                        type: n.type || 'node',
+                        complexity: complexityMap.get(n.name) || 0
+                    }}
+                }})),
+                ...edgesData.map(e => ({{
+                    data: {{ 
+                        source: String(e.source), 
+                        target: String(e.target),
+                        relation: e.relation || ''
+                    }}
+                }}))
+            ];
+            
+            const cy = cytoscape({{
+                container: document.getElementById('cy'),
+                elements: elements,
+                style: [
+                    {{
+                        selector: 'node',
+                        style: {{
+                            'background-color': function(ele) {{
+                                const colors = {{'L0':'#FF6B6B','L1':'#4ECDC4','L2':'#45B7D1','L3':'#96CEB4','L4':'#FFEAA7'}};
+                                return colors[ele.data('layer')] || '#999';
+                            }},
+                            'label': 'data(label)',
+                            'width': function(ele) {{ return 20 + Math.min(ele.data('complexity') || 0, 30); }},
+                            'height': function(ele) {{ return 20 + Math.min(ele.data('complexity') || 0, 30); }},
+                            'font-size': '10px',
+                            'text-valign': 'center',
+                            'text-halign': 'center',
+                            'text-wrap': 'wrap',
+                            'text-max-width': '80px',
+                            'border-width': 2,
+                            'border-color': '#333'
+                        }}
+                    }},
+                    {{
+                        selector: 'edge',
+                        style: {{
+                            'width': 2,
+                            'line-color': '#ccc',
+                            'target-arrow-color': '#ccc',
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'bezier'
+                        }}
+                    }},
+                    {{
+                        selector: '.highlighted',
+                        style: {{
+                            'background-color': '#2ecc71',
+                            'line-color': '#2ecc71',
+                            'target-arrow-color': '#2ecc71',
+                            'border-color': '#27ae60',
+                            'border-width': 3
+                        }}
+                    }},
+                    {{
+                        selector: '.dimmed',
+                        style: {{
+                            'opacity': 0.2
+                        }}
+                    }}
+                ],
+                layout: {{
+                    name: 'fcose',
+                    animate: true,
+                    animationDuration: 1000,
+                    fit: true,
+                    padding: 50
+                }}
+            }});
+            
+            // Node click interaction
+            cy.on('tap', 'node', function(evt) {{
+                const node = evt.target;
+                
+                cy.elements().removeClass('highlighted dimmed');
+                
+                const connected = node.neighborhood().add(node);
+                cy.elements().not(connected).addClass('dimmed');
+                connected.addClass('highlighted');
+                
+                // Show info
+                const info = document.getElementById('info');
+                info.style.display = 'block';
+                info.innerHTML = `
+                    <strong>${{node.data('label')}}</strong><br/>
+                    <strong>Layer:</strong> ${{node.data('layer')}}<br/>
+                    <strong>Type:</strong> ${{node.data('type')}}<br/>
+                    <strong>Complexity:</strong> ${{node.data('complexity')}}<br/>
+                    <strong>Connections:</strong> ${{node.degree()}}
+                `;
+            }});
+            
+            // Click background to clear
+            cy.on('tap', function(evt) {{
+                if (evt.target === cy) {{
+                    cy.elements().removeClass('highlighted dimmed');
+                    document.getElementById('info').style.display = 'none';
+                }}
+            }});
+            
+            function changeLayout(layoutName) {{
+                cy.layout({{
+                    name: layoutName,
+                    animate: true,
+                    animationDuration: 1000,
+                    fit: true,
+                    padding: 50,
+                    directed: true,
+                    spacingFactor: layoutName === 'breadthfirst' ? 1.5 : 1.2
+                }}).run();
+            }}
+            
+            function resetView() {{
+                cy.elements().removeClass('highlighted dimmed');
+                document.getElementById('info').style.display = 'none';
+                cy.fit(50);
+            }}
+            
+            function fitGraph() {{
+                cy.fit(50);
+            }}
+            
+            function showAll() {{
+                cy.elements().removeClass('highlighted dimmed');
+                document.getElementById('info').style.display = 'none';
+            }}
+            
+            function searchNodes(term) {{
+                cy.elements().removeClass('highlighted dimmed');
+                
+                if (!term) {{
+                    document.getElementById('info').style.display = 'none';
+                    return;
+                }}
+                
+                const found = cy.nodes().filter(n => 
+                    n.data('label').toLowerCase().includes(term.toLowerCase())
+                );
+                
+                if (found.length > 0) {{
+                    cy.elements().addClass('dimmed');
+                    found.removeClass('dimmed').addClass('highlighted');
+                    cy.animate({{
+                        fit: {{ eles: found, padding: 100 }},
+                        duration: 500
+                    }});
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+def create_d3_viz(data: Dict, complexity_map: pd.DataFrame, filters: Dict) -> str:
+    """D3.js radial tree visualization"""
+    data_json = json.dumps(data)
+    complexity_json = complexity_map.to_json(orient='records') if not complexity_map.empty else '[]'
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://d3js.org/d3.v7.min.js"></script>
+        <style>
+            body {{ margin: 0; background: #f8f9fa; font-family: Arial; }}
+            .node circle {{ stroke: #333; stroke-width: 2px; cursor: pointer; transition: all 0.3s; }}
+            .node circle:hover {{ stroke: #ff6b6b; stroke-width: 4px; }}
+            .node circle.focused {{ stroke: #2ecc71; stroke-width: 4px; }}
+            .node circle.dimmed {{ opacity: 0.15; }}
+            .node text {{ font-size: 11px; pointer-events: none; }}
+            .node text.dimmed {{ opacity: 0.2; }}
+            .link {{ fill: none; stroke: #ccc; stroke-width: 2px; transition: all 0.3s; }}
+            .link.dimmed {{ opacity: 0.1; }}
+            .link.focused {{ stroke: #2ecc71; stroke-width: 3px; }}
+            .tooltip {{ position: absolute; padding: 10px; background: rgba(0,0,0,0.9); 
+                       color: white; border-radius: 5px; opacity: 0; pointer-events: none; }}
+            .controls {{ position: fixed; top: 10px; left: 10px; background: white; 
+                        padding: 10px; border-radius: 5px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+            .controls button {{ margin: 3px; padding: 6px 10px; cursor: pointer; }}
+            .search {{ position: fixed; top: 10px; right: 10px; background: white; 
+                      padding: 10px; border-radius: 5px; }}
+            .search input {{ padding: 6px; border: 1px solid #ddd; border-radius: 3px; }}
+        </style>
+    </head>
+    <body>
+        <div class="controls">
+            <button onclick="resetView()">Reset</button>
+            <button onclick="toggleLabels()">Labels</button>
+        </div>
+        <div class="search">
+            <input type="text" placeholder="Search..." onkeyup="search(this.value)">
+        </div>
+        <div id="graph"></div>
+        <div class="tooltip" id="tooltip"></div>
+        
+        <script>
+            const data = {data_json};
+            const complexity = {complexity_json};
+            const width = 1200, height = 800;
+            let focused = null, showLabels = true;
+            
+            const complexityMap = new Map(complexity.map(d => [d.capability, d.complexity]));
+            
+            const svg = d3.select("#graph").append("svg")
+                .attr("width", width).attr("height", height)
+                .call(d3.zoom().scaleExtent([0.1, 4])
+                    .on("zoom", e => g.attr("transform", e.transform)));
+            
+            const g = svg.append("g").attr("transform", `translate(${{width/2}},${{height/2}})`);
+            const linkG = g.append("g"), nodeG = g.append("g");
+            
+            const tree = d3.tree()
+                .size([2 * Math.PI, Math.min(width, height) / 2 - 100])
+                .separation((a, b) => (a.parent == b.parent ? 1 : 2) / a.depth);
+            
+            function update() {{
+                const root = d3.hierarchy(data);
+                tree(root);
+                
+                const link = linkG.selectAll(".link")
+                    .data(root.links(), d => d.target.data.id)
+                    .join("path")
+                    .attr("class", d => {{
+                        if (!focused) return "link";
+                        const isFocused = d.source.data.id === focused.data.id || d.target.data.id === focused.data.id;
+                        return isFocused ? "link focused" : "link dimmed";
+                    }})
+                    .attr("d", d3.linkRadial().angle(d => d.x).radius(d => d.y));
+                
+                const node = nodeG.selectAll(".node")
+                    .data(root.descendants(), d => d.data.id)
+                    .join("g")
+                    .attr("class", "node")
+                    .attr("transform", d => `rotate(${{d.x * 180 / Math.PI - 90}}) translate(${{d.y}},0)`)
+                    .on("click", (e, d) => {{ focused = focused?.data.id === d.data.id ? null : d; update(); }});
+                
+                node.selectAll("circle").remove();
+                node.append("circle")
+                    .attr("r", d => {{
+                        const c = complexityMap.get(d.data.name) || 0;
+                        return d.depth === 0 ? 10 : 5 + Math.min(c / 5, 10);
+                    }})
+                    .attr("class", d => {{
+                        if (!focused) return "";
+                        return d.data.id === focused.data.id ? "focused" : "dimmed";
+                    }})
+                    .style("fill", d => {{
+                        const colors = {{'L0':'#FF6B6B','L1':'#4ECDC4','L2':'#45B7D1','L3':'#96CEB4','L4':'#FFEAA7'}};
+                        return colors[d.data.properties?.layer] || '#999';
+                    }})
+                    .on("mouseover", (e, d) => {{
+                        d3.select("#tooltip").style("opacity", 1)
+                            .html(`<b>${{d.data.name}}</b><br/>Type: ${{d.data.label}}<br/>Layer: ${{d.data.properties?.layer||'N/A'}}`)
+                            .style("left", e.pageX + 10 + "px").style("top", e.pageY - 10 + "px");
+                    }})
+                    .on("mouseout", () => d3.select("#tooltip").style("opacity", 0));
+                
+                node.selectAll("text").remove();
+                node.append("text")
+                    .attr("dy", "0.31em")
+                    .attr("x", d => d.x < Math.PI ? 8 : -8)
+                    .attr("text-anchor", d => d.x < Math.PI ? "start" : "end")
+                    .attr("transform", d => d.x >= Math.PI ? "rotate(180)" : null)
+                    .attr("class", d => focused && d.data.id !== focused.data.id ? "dimmed" : "")
+                    .text(d => showLabels ? (d.data.name.length > 20 ? d.data.name.substring(0,20)+"..." : d.data.name) : "");
+            }}
+            
+            function resetView() {{ focused = null; update(); 
+                svg.transition().duration(750).call(d3.zoom().transform, d3.zoomIdentity.translate(width/2, height/2)); }}
+            function toggleLabels() {{ showLabels = !showLabels; update(); }}
+            function search(term) {{
+                if (!term) {{ focused = null; update(); return; }}
+                const root = d3.hierarchy(data);
+                focused = root.descendants().find(d => d.data.name.toLowerCase().includes(term.toLowerCase()));
+                update();
+            }}
+            
+            update();
+        </script>
+    </body>
+    </html>
+    """
+
+# Main App
+def main():
+    st.title("🏗️ Knowledge Graph Viewer")
+    
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    
+    # Login
+    if not st.session_state.authenticated:
+        with st.form("login"):
+            user = st.text_input("Username")
+            pwd = st.text_input("Password", type="password")
+            if st.form_submit_button("Login"):
+                try:
+                    conn = get_connection(user, pwd)
+                    conn.close()
+                    st.session_state.authenticated = True
+                    st.session_state.user = user
+                    st.session_state.pwd = pwd
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Login failed: {e}")
+        return
+    
+    # Main App
+    conn = get_connection(st.session_state.user, st.session_state.pwd)
+    nodes, edges = load_data(conn)
+    conn.close()
+    
+    if nodes.empty:
+        st.warning("No data found")
+        return
+    
+    analyzer = ArchitectureAnalyzer(nodes, edges)
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("Controls")
+        
+        domains = nodes[nodes['label'] == 'Domain']['name'].unique()
+        domain = st.selectbox("Domain", domains if len(domains) > 0 else ["None"])
+        
+        st.subheader("Layers")
+        layers = {f'L{i}': st.checkbox(f'L{i}', value=True) for i in range(5)}
+        active_layers = {k for k, v in layers.items() if v}
+        
+        max_depth = st.slider("Max Depth", 1, 5, 5)
+        min_complexity = st.slider("Min Complexity", 0, 20, 0)
+        
+        # Visualization toggle
+        st.divider()
+        viz_type = st.radio(
+            "Visualization Type",
+            ["Cytoscape Network", "D3 Radial Tree"],
+            help="Switch between network and tree layouts"
+        )
+        
+        if viz_type == "Cytoscape Network":
+            st.caption("🔵 Better for: Large graphs, exploring connections, multiple layouts")
+        else:
+            st.caption("🟢 Better for: Clear hierarchies, parent-child relationships")
+        
+        st.divider()
+        view = st.radio("View", ["Map", "Dependencies", "Components"])
+        
+        if st.button("Logout"):
+            st.session_state.authenticated = False
+            st.rerun()
+        
+        # API Config
+        with st.expander("API Settings"):
+            API_CONFIG["base_url"] = st.text_input("API URL", API_CONFIG["base_url"])
+            auth = st.radio("Auth", ["Username/Password", "API Key"])
+            if auth == "Username/Password":
+                API_CONFIG["username"] = st.text_input("Username", API_CONFIG["username"])
+                API_CONFIG["password"] = st.text_input("Password", type="password")
+            else:
+                API_CONFIG["api_key"] = st.text_input("API Key", type="password")
+            
+            if st.button("Test API"):
+                result = query_llm("Hello", "Test")
+                st.success("✅ Connected") if "Error" not in result else st.error(result)
+    
+    # Main Content
+    if view == "Map":
+        col1, col2 = st.columns([2.5, 1.5])
+        
+        with col1:
+            st.subheader(f"📊 {domain} - {viz_type}")
+            
+            # Prepare data
+            complexity = analyzer.complexity_map()
+            
+            if viz_type == "Cytoscape Network":
+                # Prepare flat node/edge lists for Cytoscape
+                cyto_nodes, cyto_edges = prepare_graph_data(nodes, edges)
+                
+                # Filter by complexity
+                if min_complexity > 0:
+                    complexity_names = set(complexity[complexity['complexity'] >= min_complexity]['capability'].tolist())
+                    cyto_nodes = [n for n in cyto_nodes if n['name'] in complexity_names or n['type'] == 'Domain']
+                    node_ids = {n['id'] for n in cyto_nodes}
+                    cyto_edges = [e for e in cyto_edges if e['source'] in node_ids and e['target'] in node_ids]
+                
+                # Filter by layers
+                cyto_nodes = [n for n in cyto_nodes if n['layer'] in active_layers or n['type'] == 'Domain']
+                
+                html = create_cytoscape_viz(cyto_nodes, cyto_edges, complexity)
+                
+                st.info("""
+                **Cytoscape Controls:**
+                - Select layout from dropdown (Force Directed recommended)
+                - Click node to highlight connections
+                - Search to find specific nodes
+                - Drag nodes to reposition
+                - Scroll to zoom, drag to pan
+                """)
+            else:
+                # D3 Radial Tree
+                tree_data = {"name": domain, "children": [], "properties": {}, "id": 0, "label": "Domain"}
+                html = create_d3_viz(tree_data, complexity, {'depth': max_depth, 'complexity': min_complexity})
+                
+                st.info("""
+                **D3 Tree Controls:**
+                - Click node to focus and dim others
+                - Search to find nodes
+                - Toggle labels for clarity
+                - Scroll to zoom, drag to pan
+                """)
+            
+            st.components.v1.html(html, height=820, scrolling=True)
+        
+        with col2:
+            st.metric("Capabilities", len(analyzer.capabilities))
+            common = analyzer.common_components()
+            if not common.empty:
+                st.metric("Shared Components", len(common))
+                with st.expander("Details"):
+                    st.dataframe(common.head(5), hide_index=True)
+            
+            complexity = analyzer.complexity_map()
+            st.write("**Most Complex:**")
+            for _, row in complexity.head(5).iterrows():
+                st.write(f"• {row['capability']} ({row['complexity']})")
+    
+    elif view == "Components":
+        st.subheader("Component Reusability")
+        common = analyzer.common_components()
+        if not common.empty:
+            st.dataframe(common, use_container_width=True, hide_index=True)
+        else:
+            st.info("No shared components found")
+    
+    elif view == "Dependencies":
+        st.subheader("Capability Dependencies")
+        cap_list = analyzer.capabilities['name'].tolist()
+        selected = st.selectbox("Select Capability", cap_list)
+        
+        if selected:
+            node = analyzer.capabilities[analyzer.capabilities['name'] == selected]
+            if not node.empty:
+                deps = analyzer.get_dependencies(int(node.iloc[0]['node_id']))
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Upstream", len(deps['upstream']))
+                col2.metric("Downstream", len(deps['downstream']))
+                col3.metric("Criticality", deps['criticality'])
+                
+                if deps['upstream']:
+                    st.write("**Depends On:**", ", ".join(deps['upstream'][:10]))
+                if deps['downstream']:
+                    st.write("**Used By:**", ", ".join(deps['downstream'][:10]))
+    
+    # Q&A
+    st.divider()
+    st.subheader("Ask Questions")
+    
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+    
+    if question := st.chat_input("Ask about the architecture..."):
+        st.session_state.messages.append({"role": "user", "content": question})
+        
+        context = build_context(analyzer, domain, active_layers)
+        with st.spinner("Analyzing..."):
+            response = query_llm(question, context)
+        
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        st.rerun()
+
+if __name__ == "__main__":
+    main()
